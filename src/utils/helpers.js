@@ -47,3 +47,14 @@ export const isValidHttpUrl = (string) => {
 
   return url.protocol === "http:" || url.protocol === "https:";
 };
+
+/** Same pattern as createOrder_test — read Endorsely referral and persist to localStorage */
+export const getEndorselyReferralId = () => {
+  const referralId =
+    window.endorsely_referral || localStorage.getItem("endorsely_referral");
+  if (referralId) {
+    localStorage.setItem("endorsely_referral", referralId);
+    return referralId;
+  }
+  return null;
+};

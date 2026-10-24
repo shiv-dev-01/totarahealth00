@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import "./paymentgetway.css";
 import "./rightside.css";
 import axios from "axios";
@@ -7,6 +7,7 @@ import { IoCloseOutline } from "react-icons/io5";
 import { FaArrowLeftLong } from "react-icons/fa6";
 import { FaTruck } from "react-icons/fa";
 import { FiChevronRight } from "react-icons/fi";
+import { Elements } from "@stripe/react-stripe-js";
 
 import useNotification from "../../utils/useNotification";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
@@ -17,6 +18,7 @@ import {
   cheke_state,
   createOrder_test,
   createOrder_test_new,
+  createOrder_stripe,
   get_checkout_link_data,
   get_product_details,
   get_url_data,
@@ -32,24 +34,47 @@ import { CiStar } from "react-icons/ci";
 // import { loadGoogleTag } from "../../utils/gtag";
 import { Stethoscope, Truck } from "lucide-react";
 import { fireBeginCheckout, fireAddPaymentInfo } from "../../utils/ga4Tracking";
+import {
+  trackMetaInitiateCheckout,
+  trackMetaAddPaymentInfo,
+  trackMetaPurchase,
+} from "../../utils/metaTracking";
+import StripeCheckoutForm from "../../components/StripeCheckoutForm";
+import {
+  buildStripeBillingDefaults,
+  createStripePaymentIntent,
+  stripeAppearance,
+  getStripePromise,
+  verifyStripePaymentSucceeded,
+} from "../../utils/stripe";
+import {
+  clearCheckoutSnapshot,
+  cleanStripeReturnParamsFromUrl,
+  getStripeReturnParams,
+  isPaymentIntentProcessed,
+  loadCheckoutSnapshot,
+  markPaymentIntentProcessed,
+  saveCheckoutSnapshot,
+} from "../../utils/stripeCheckoutSession";
+import { buildCreateOrderStripeBody } from "../../utils/createOrderStripe";
+import { getEndorselyReferralId } from "../../utils/helpers";
+import {
+  getOrderCommission,
+  getProductSku,
+  toCommissionApiFields,
+  appendCommissionFormData,
+} from "../../utils/affiliateCommission";
 
-// Product-specific disclaimer: supply duration and pricing (total + monthly)
-const PRODUCT_DISCLAIMER_CONFIG = {
-  "93": { months: 3, total: 405, monthly: 135 },
-  "95": { months: 3, total: 600, monthly: 200 },
-  "96": { months: 6, total: 720, monthly: 120 },
-  "97": { months: 6, total: 1080, monthly: 180 },
-  "98": { months: 12, total: 1199, monthly: 99.92 },
-  "99": { months: 12, total: 1799, monthly: 149.92 },
-};
+// Drop duplicate InitiateCheckout from the same page load (Strict Mode /
+// FetchProduct called twice). Window is short so a later visit still fires.
+let metaInitiateCheckoutLock = { key: "", at: 0 };
+const META_INITIATE_CHECKOUT_DEDUP_MS = 2500;
 
-// Product IDs that show "Monthly Cost Line Item" in order summary, with fixed monthly price (null = use price/months).
-const MONTHLY_COST_LINE_PRODUCTS = {
-  "92": 189.95,  // Compounded Semaglutide - 1 Month
-  "93": 135.0,   // Compounded Semaglutide - 3 Months
-  "94": 239.95,  // Compounded Tirzepatide - 1 Month
-  "95": 200.0,   // Compounded Tirzepatide - 3 Months
-  "96": null,    // Compounded Semaglutide - 6 Months (use calculated price/months)
+const getMonthsFromProductName = (productName = "") => {
+  if (productName.includes("12 Month")) return 12;
+  if (productName.includes("6 Month")) return 6;
+  if (productName.includes("3 Month")) return 3;
+  return 1;
 };
 
 const Checkout2 = () => {
@@ -107,6 +132,11 @@ const Checkout2 = () => {
 
   // section 2 conditions
   const [getsection2, setSection2] = useState(false);
+  // ── Stripe payment state ──────────────────────────────────────────────────
+  const [stripeClientSecret, setStripeClientSecret] = useState(null);
+  const [isCreatingPaymentIntent, setIsCreatingPaymentIntent] = useState(false);
+  const [stripePaymentError, setStripePaymentError] = useState(null);
+  const stripeRedirectHandledRef = useRef(false);
   const [sameAsShipping, setSameAsShipping] = useState(true); // Default to same address
 
   //billing address start
@@ -134,6 +164,38 @@ const Checkout2 = () => {
   // URL hash fragment (for affiliate tracking)
   const [urlHashFragment, setUrlHashFragment] = useState("");
 
+  const getCouponProductId = () => {
+    if (getproducts?.length > 0) {
+      return getproducts
+        .map((product) => product.product_id)
+        .filter(Boolean)
+        .join(",");
+    }
+    return getdata?.product_id || id;
+  };
+
+  // Helper: strip thousands-separator commas before parsing (API can return "4,595.97")
+  const parseAmount = (val) => parseFloat(String(val ?? "").replace(/,/g, "")) || 0;
+
+  const getCouponSavings = () => {
+    const subtotal = parseFloat(getproductPrice);
+    if (isNaN(subtotal)) return 0;
+    if (
+      discount_percent &&
+      discount_percent !== "0.00" &&
+      parseFloat(discount_percent) > 0
+    ) {
+      return (subtotal * (parseFloat(discount_percent) || 0)) / 100;
+    }
+    return parseAmount(discount_amount);
+  };
+
+  const getDiscountedTotal = () => {
+    const subtotal = parseFloat(getproductPrice);
+    if (isNaN(subtotal)) return "";
+    return Math.max(0, subtotal - getCouponSavings()).toFixed(2);
+  };
+
   const handleApplyDiscount = async () => {
     setError(""); // Clear previous errors
 
@@ -147,8 +209,9 @@ const Checkout2 = () => {
       return;
     }
 
-    if (!getproducts.length || !getproducts[0]?.product_id) {
-      notifyError("Product information is missing");
+    const couponProductId = getCouponProductId();
+    if (!couponProductId) {
+      notifyError("Product information is missing. Please refresh and try again.");
       return;
     }
 
@@ -157,7 +220,7 @@ const Checkout2 = () => {
       const response = await axios.post(check_coupons, {
         site_id: SITE_ID,
         promo_codes: discountCode.trim(),
-        product_id: String(getproducts[0].product_id),
+        product_id: String(couponProductId),
         email: email.trim(),
       });
 
@@ -166,13 +229,20 @@ const Checkout2 = () => {
         setApplyLoading(false);
         console.log("responce.data", response.data);
         setAppliedDiscount(response.data.data?.code || discountCode.trim()); // Store applied code
-        setdiscount_percent(response.data.discount_percent);
-        setdiscount_amount(response.data.discount_amount);
+        setdiscount_percent(
+          response.data.discount_percent ??
+            response.data.data?.discount_percent ??
+            0
+        );
+        setdiscount_amount(
+          response.data.discount_amount ??
+            response.data.data?.discount_amount ??
+            0
+        );
       } else {
         setApplyLoading(false);
         setAppliedDiscount(null);
-        // setError("Invalid code");
-        notifyError("Invalid code");
+        notifyError(response.data.message || "Invalid code");
       }
     } catch (err) {
       setApplyLoading(false);
@@ -296,6 +366,20 @@ const Checkout2 = () => {
             coupon: appliedDiscount || '',
             discountAmount: discount_amount || 0,
           });
+          const initiateCheckoutKey = validProducts
+            .map((p) => p.product_id)
+            .join("_");
+          const now = Date.now();
+          const isDuplicateInitiateCheckout =
+            metaInitiateCheckoutLock.key === initiateCheckoutKey &&
+            now - metaInitiateCheckoutLock.at < META_INITIATE_CHECKOUT_DEDUP_MS;
+          if (!isDuplicateInitiateCheckout) {
+            metaInitiateCheckoutLock = { key: initiateCheckoutKey, at: now };
+            trackMetaInitiateCheckout({
+              value: totalPrice,
+              products: validProducts,
+            });
+          }
         } catch (error) {
           console.error("Error firing ce_begin_checkout:", error);
         }
@@ -937,6 +1021,30 @@ const Checkout2 = () => {
   }, []);
   // google map end
 
+  useEffect(() => {
+    const persistReferral = () => {
+      const referralId = window.endorsely_referral;
+      if (referralId) {
+        localStorage.setItem("endorsely_referral", referralId);
+        return true;
+      }
+      return false;
+    };
+
+    if (persistReferral()) return;
+
+    const interval = setInterval(() => {
+      if (persistReferral()) clearInterval(interval);
+    }, 300);
+
+    const timeout = setTimeout(() => clearInterval(interval), 5000);
+
+    return () => {
+      clearInterval(interval);
+      clearTimeout(timeout);
+    };
+  }, []);
+
   const handleStateChange = async (value) => {
     // setIsLoading(true);
     var params = {
@@ -1021,6 +1129,509 @@ const Checkout2 = () => {
         setIsCityLoading(false);
       });
   };
+
+  // ── Stripe helpers ─────────────────────────────────────────────────────────
+
+  const calculateTotal = useCallback(() => {
+    const subtotal = parseFloat(getproductPrice);
+    if (isNaN(subtotal)) return 0;
+    let savings = 0;
+    if (
+      discount_percent &&
+      discount_percent !== "0.00" &&
+      parseFloat(discount_percent) > 0
+    ) {
+      savings = (subtotal * (parseFloat(discount_percent) || 0)) / 100;
+    } else if (discount_amount && parseAmount(discount_amount) > 0) {
+      savings = parseAmount(discount_amount);
+    }
+    return Math.max(0, subtotal - savings);
+  }, [getproductPrice, discount_percent, discount_amount]);
+
+  const getCheckoutAmountCents = useCallback(() => {
+    return Math.round(calculateTotal() * 100);
+  }, [calculateTotal]);
+
+  const getAffiliateCommission = useCallback(() => {
+    return getOrderCommission(getproducts, calculateTotal());
+  }, [getproducts, calculateTotal]);
+
+  const hasShippingForStripe = useMemo(
+    () =>
+      Boolean(
+        firstName?.trim() &&
+          lastName?.trim() &&
+          address?.trim() &&
+          city?.trim() &&
+          getselectedStateCode.state_code &&
+          postalCode?.trim()
+      ),
+    [firstName, lastName, address, city, getselectedStateCode, postalCode]
+  );
+
+  const stripeBillingDefaults = useMemo(
+    () =>
+      buildStripeBillingDefaults({
+        email,
+        firstName,
+        lastName,
+        phone: phoneNumber,
+        sameAsShipping,
+        firstName2,
+        lastName2,
+        phoneNumber2,
+        address,
+        aptSuite,
+        city,
+        stateCode: getselectedStateCode.state_code,
+        postalCode,
+        address2,
+        city2,
+        billingStateCode: getselectedStateCode2.state_code,
+        postalCode2,
+      }),
+    [
+      email,
+      firstName,
+      lastName,
+      phoneNumber,
+      sameAsShipping,
+      firstName2,
+      lastName2,
+      phoneNumber2,
+      address,
+      aptSuite,
+      city,
+      getselectedStateCode,
+      postalCode,
+      address2,
+      city2,
+      getselectedStateCode2,
+      postalCode2,
+    ]
+  );
+
+  const getStripePaymentPayload = useCallback(
+    (amountCentsOverride) => {
+      const primary = getproducts[0] || getdata || {};
+      return {
+        email,
+        firstName,
+        lastName,
+        phone: phoneNumber,
+        addressLine1: address,
+        addressLine2: aptSuite,
+        city,
+        state: getselectedStateCode.state_code || "",
+        zip: postalCode,
+        sameAsShipping,
+        billingAddressLine1: address2,
+        billingAddressLine2: "",
+        billingCity: city2,
+        billingState: getselectedStateCode2.state_code || "",
+        billingZip: postalCode2,
+        billingFirstName: firstName2,
+        billingLastName: lastName2,
+        productName: primary.product_name || "Medication",
+        sku: primary.sku || String(primary.product_id || ""),
+        amount:
+          amountCentsOverride !== undefined
+            ? amountCentsOverride
+            : getCheckoutAmountCents(),
+        currency: "usd",
+        productId: String(getCouponProductId() || primary.product_id || ""),
+        coupon: appliedDiscount || null,
+        referralId: getEndorselyReferralId(),
+        ...toCommissionApiFields(getAffiliateCommission()),
+      };
+    },
+    [
+      getproducts,
+      getdata,
+      email,
+      firstName,
+      lastName,
+      phoneNumber,
+      address,
+      aptSuite,
+      city,
+      getselectedStateCode,
+      postalCode,
+      sameAsShipping,
+      address2,
+      city2,
+      getselectedStateCode2,
+      postalCode2,
+      firstName2,
+      lastName2,
+      getCheckoutAmountCents,
+      appliedDiscount,
+      getAffiliateCommission,
+    ]
+  );
+
+  const initStripePaymentIntent = useCallback(async () => {
+    if (!email || !email.includes("@") || !hasShippingForStripe) return;
+    const payload = getStripePaymentPayload();
+    if (!payload.amount || payload.amount < 50) return;
+
+    try {
+      setIsCreatingPaymentIntent(true);
+      setStripePaymentError(null);
+      const secret = await createStripePaymentIntent(payload);
+      setStripeClientSecret(secret);
+    } catch (err) {
+      setStripeClientSecret(null);
+      setStripePaymentError(
+        err instanceof Error ? err.message : "Failed to initialize payment"
+      );
+    } finally {
+      setIsCreatingPaymentIntent(false);
+    }
+  }, [email, hasShippingForStripe, getStripePaymentPayload]);
+
+  useEffect(() => {
+    if (
+      getsection2 &&
+      hasShippingForStripe &&
+      email &&
+      calculateTotal() >= 0.5
+    ) {
+      initStripePaymentIntent();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    getsection2,
+    hasShippingForStripe,
+    email,
+    discount_percent,
+    discount_amount,
+    appliedDiscount,
+    sameAsShipping,
+    address,
+    city,
+    postalCode,
+    getselectedStateCode.state_code,
+    address2,
+    city2,
+    postalCode2,
+    getselectedStateCode2.state_code,
+  ]);
+
+  useEffect(() => {
+    if (!getsection2) {
+      setStripeClientSecret(null);
+      setStripePaymentError(null);
+    }
+  }, [getsection2]);
+
+  const getCheckoutSnapshot = useCallback(() => {
+    const productMap = new Map();
+    getproducts.forEach((product) => {
+      const pid = product.product_id;
+      if (productMap.has(pid)) {
+        productMap.get(pid).quantity += 1;
+      } else {
+        productMap.set(pid, { ...product, quantity: 1 });
+      }
+    });
+    const uniqueProducts = Array.from(productMap.values());
+    const referralId = getEndorselyReferralId();
+    const commission = getOrderCommission(uniqueProducts, calculateTotal());
+    return {
+      email,
+      firstName,
+      lastName,
+      phoneNumber,
+      address,
+      aptSuite,
+      city,
+      stateCode: getselectedStateCode.state_code,
+      postalCode,
+      sameAsShipping,
+      address2,
+      city2,
+      billingStateCode: getselectedStateCode2.state_code,
+      postalCode2,
+      appliedDiscount,
+      campaignId: getcampaignID,
+      contactDetailsId: contact_details_id,
+      productIds: uniqueProducts.map((p) => p.product_id),
+      productPrices: uniqueProducts.map((p) => p.product_price),
+      originalPrices: uniqueProducts.map(
+        (p) => p.original_price || p.product_price
+      ),
+      gatewayIds: uniqueProducts.map((p) => p.gateway_id || "1"),
+      billingModelIds: uniqueProducts.map((p) => p.billing_model_id || "3"),
+      promoCodes: uniqueProducts.map((p) => p.promoCode || "0"),
+      quantities: uniqueProducts.map((p) => String(p.quantity)),
+      smsTransactional,
+      smsMarketing,
+      referralId: referralId || null,
+      ...toCommissionApiFields(commission),
+    };
+  }, [
+    getproducts,
+    email,
+    firstName,
+    lastName,
+    phoneNumber,
+    address,
+    aptSuite,
+    city,
+    getselectedStateCode,
+    postalCode,
+    sameAsShipping,
+    address2,
+    city2,
+    getselectedStateCode2,
+    postalCode2,
+    appliedDiscount,
+    getcampaignID,
+    contact_details_id,
+    smsTransactional,
+    smsMarketing,
+    calculateTotal,
+  ]);
+
+  const validateBillingAddress = useCallback(() => {
+    if (!sameAsShipping) {
+      if (!address2) {
+        notifyError("Please enter billing address.");
+        return false;
+      }
+      if (!getselectedStateCode2.state_code) {
+        notifyError("Please select billing state.");
+        return false;
+      }
+      if (!city2) {
+        notifyError("Please enter billing city.");
+        return false;
+      }
+      if (!postalCode2) {
+        notifyError("Please enter billing postal code.");
+        return false;
+      }
+    }
+    return true;
+  }, [
+    sameAsShipping,
+    address2,
+    getselectedStateCode2,
+    city2,
+    postalCode2,
+    notifyError,
+  ]);
+
+  const submitCreateOrderStripe = useCallback(
+    async (paymentToken, snapshot) => {
+      const snap = snapshot || getCheckoutSnapshot();
+
+      if (!snap.productIds || snap.productIds.length === 0) {
+        notifyError("No products found. Please try again.");
+        return;
+      }
+
+      const body = buildCreateOrderStripeBody({
+        email: snap.email,
+        firstName: snap.firstName,
+        lastName: snap.lastName,
+        phoneNumber: snap.phoneNumber,
+        address: snap.address,
+        aptSuite: snap.aptSuite,
+        city: snap.city,
+        stateCode: snap.stateCode,
+        postalCode: snap.postalCode,
+        sameAsShipping: snap.sameAsShipping,
+        address2: snap.address2,
+        city2: snap.city2,
+        billingStateCode: snap.billingStateCode,
+        postalCode2: snap.postalCode2,
+        appliedDiscount: snap.appliedDiscount,
+        campaignId: snap.campaignId,
+        contactDetailsId: snap.contactDetailsId,
+        productIds: snap.productIds,
+        productPrices: snap.productPrices,
+        originalPrices: snap.originalPrices,
+        gatewayIds: snap.gatewayIds,
+        billingModelIds: snap.billingModelIds,
+        promoCodes: snap.promoCodes,
+        quantities: snap.quantities,
+        paymentToken,
+        smsTransactional: snap.smsTransactional,
+        smsMarketing: snap.smsMarketing,
+        referralId: snap.referralId,
+        commissionType: snap.commissionType,
+        commissionAmount: snap.commissionAmount,
+        commissionCurrency: snap.commissionCurrency,
+        productFamily: snap.productFamily,
+        planMonths: snap.planMonths,
+        sku: snap.sku,
+        productName: snap.productName,
+        orderValue: snap.orderValue,
+        commissionLines: snap.commissionLines,
+      });
+
+      console.log("[createOrder_stripe] payload:", body);
+
+      const Response = await axios.post(createOrder_stripe, body, {
+        headers: { "Content-Type": "application/json" },
+      });
+
+      console.log("[createOrder_stripe] response:", Response.data);
+
+      const data = Response.data;
+      let orders = [];
+      if (Array.isArray(data)) {
+        orders = data.filter((o) => o.status === 1 || o.status === true);
+      } else if (data?.status === 1 || data?.status === true) {
+        orders = [data];
+      } else if (data?.data && (data.data.status === 1 || data.data.order_id)) {
+        orders = [data.data];
+      }
+
+      if (orders.length > 0) {
+        const firstOrder = orders[0];
+        const orderId =
+          firstOrder.order_id ||
+          firstOrder.orderId ||
+          firstOrder.id ||
+          firstOrder.OrderID ||
+          paymentToken;
+        const productTotal = calculateTotal().toFixed(2);
+        const productId =
+          snap.productIds?.filter(Boolean).join(",") || snap.productIds[0];
+        const orderIds = orders
+          .map(
+            (o) =>
+              o.order_id || o.orderId || o.id || o.OrderID || null
+          )
+          .filter(Boolean);
+        if (orderIds.length === 0 && orderId) orderIds.push(orderId);
+
+        setorder_id(orderIds[0]);
+
+        let hashFragment = "";
+        if (urlHashFragment) {
+          hashFragment = urlHashFragment;
+        }
+
+        navigate(`/thankyou-page${hashFragment}`, {
+          state: {
+            email: snap.email,
+            phoneNumber: snap.phoneNumber,
+            orderId: orderIds[0],
+            orderIds,
+            firstName: snap.firstName,
+            lastName: snap.lastName,
+            stateName: getselectedStateCode.name,
+            stateCode: snap.stateCode,
+            city: snap.city,
+            postalCode: snap.postalCode,
+            country: country,
+            productTotal,
+            productId,
+            products: getproducts,
+            coupon: snap.appliedDiscount || "",
+            discountAmount: getCouponSavings(),
+          },
+        });
+
+        if (window.gtag) {
+          window.gtag("event", "conversion", {
+            send_to: "AW-11515103107",
+            transaction_id: orderIds[0],
+          });
+        }
+        trackMetaPurchase({
+          orderId: orderIds[0],
+          value: productTotal,
+          products: getproducts,
+          userData: {
+            email: snap.email,
+            phone: snap.phoneNumber,
+            firstName: snap.firstName,
+            lastName: snap.lastName,
+            city: snap.city,
+            state: snap.stateCode,
+            postalCode: snap.postalCode,
+            country: country,
+          },
+        });
+      } else {
+        const failMsg = Array.isArray(data)
+          ? data[0]?.message || "Order creation failed"
+          : data?.message || data?.error || "Order creation failed";
+        throw new Error(failMsg);
+      }
+    },
+    [
+      getCheckoutSnapshot,
+      navigate,
+      notifyError,
+      calculateTotal,
+      getselectedStateCode,
+      urlHashFragment,
+      country,
+      getproducts,
+      discount_amount,
+    ]
+  );
+
+  const finalizeStripeOrder = useCallback(
+    async (paymentToken, clientSecret) => {
+      if (!paymentToken || !clientSecret) {
+        notifyError("Payment verification failed. Please try again.");
+        return;
+      }
+      if (isPaymentIntentProcessed(paymentToken)) {
+        console.log("[stripe] order already created for", paymentToken);
+        return;
+      }
+      setIsLoading(true);
+      try {
+        await verifyStripePaymentSucceeded(paymentToken, clientSecret);
+        const snapshot = loadCheckoutSnapshot() || getCheckoutSnapshot();
+        await submitCreateOrderStripe(paymentToken, snapshot);
+        markPaymentIntentProcessed(paymentToken);
+        clearCheckoutSnapshot();
+        cleanStripeReturnParamsFromUrl();
+      } catch (error) {
+        console.log("[stripe] finalize order error:", error);
+        setIsLoading(false);
+        notifyError(
+          error instanceof Error
+            ? error.message
+            : "Payment succeeded but order creation failed. Please contact support."
+        );
+      }
+    },
+    [notifyError, getCheckoutSnapshot, submitCreateOrderStripe]
+  );
+
+  useEffect(() => {
+    const handleStripeRedirectReturn = async () => {
+      if (stripeRedirectHandledRef.current) return;
+      const { paymentIntentId, clientSecret, redirectStatus } =
+        getStripeReturnParams();
+      if (!paymentIntentId || !clientSecret) return;
+      stripeRedirectHandledRef.current = true;
+      if (redirectStatus && redirectStatus !== "succeeded") {
+        notifyError(`Payment was not completed (${redirectStatus}).`);
+        cleanStripeReturnParamsFromUrl();
+        return;
+      }
+      try {
+        await finalizeStripeOrder(paymentIntentId, clientSecret);
+      } catch {
+        /* finalizeStripeOrder already notifies */
+      }
+    };
+    handleStripeRedirectReturn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── End Stripe helpers ─────────────────────────────────────────────────────
 
   // page 1 validation
 
@@ -1222,6 +1833,16 @@ const Checkout2 = () => {
     formData.append("promo_codes", appliedDiscount);
     formData.append("campaign_id", getcampaignID);
 
+    const referralId = getEndorselyReferralId();
+    if (referralId) {
+      formData.append("referralId", referralId);
+    }
+
+    appendCommissionFormData(
+      formData,
+      getOrderCommission(getproducts, calculateTotal())
+    );
+
         // sms consent
     formData.append("sms_transactional", smsTransactional ? 1 : 0);
     formData.append("sms_marketing", smsMarketing ? 1 : 0);
@@ -1245,6 +1866,8 @@ const Checkout2 = () => {
       formData.append("gateway_id[]", gatewayIds[index]);
       formData.append("billing_model_id[]", billingModelIds[index]);
       formData.append("promoCodes[]", promoCodes[index]);
+      const lineSku = getProductSku(getproducts[index] || { product_id: productId });
+      if (lineSku) formData.append("sku[]", lineSku);
     });
 
     console.log("FormData entries:");
@@ -1322,24 +1945,13 @@ const Checkout2 = () => {
               city: city,
               postalCode: postalCode,
               country: country,
-              productTotal:
-                getproductPrice != null && !isNaN(getproductPrice)
-                  ? discount_percent && discount_percent !== "0.00"
-                    ? (
-                        parseFloat(getproductPrice) -
-                        (parseFloat(getproductPrice) *
-                          (parseFloat(discount_percent) || 0)) /
-                          100
-                      ).toFixed(2)
-                    : (
-                        parseFloat(getproductPrice) -
-                        (parseFloat(discount_amount) || 0)
-                      ).toFixed(2)
-                  : "",
-              productId: getproducts[0]?.product_id || "",
+              productTotal: getDiscountedTotal(),
+              productId:
+                getproducts.map((p) => p.product_id).filter(Boolean).join(",") ||
+                "",
               products: getproducts, // Pass full products array for purchase event
               coupon: appliedDiscount || "",
-              discountAmount: discount_amount || 0,
+              discountAmount: getCouponSavings(),
             },
           });
           // google tag pixel start Event snippet for Purchase conversion page
@@ -1350,27 +1962,21 @@ const Checkout2 = () => {
             });
           }
           // google tag pixel end
-          // facebook pixel start
-          if (window.fbq) {
-            window.fbq("track", "Purchase", {
-              value:
-                getproductPrice != null && !isNaN(getproductPrice)
-                  ? discount_percent && discount_percent !== "0.00"
-                    ? (
-                        parseFloat(getproductPrice) -
-                        (parseFloat(getproductPrice) *
-                          (parseFloat(discount_percent) || 0)) /
-                          100
-                      ).toFixed(2)
-                    : (
-                        parseFloat(getproductPrice) -
-                        (parseFloat(discount_amount) || 0)
-                      ).toFixed(2)
-                  : "",
-              currency: "USD",
-            });
-          }
-          // facebook pixel end
+          trackMetaPurchase({
+            orderId: orderIds[0],
+            value: getDiscountedTotal() || 0,
+            products: getproducts,
+            userData: {
+              email,
+              phone: phoneNumber,
+              firstName,
+              lastName,
+              city,
+              state: getselectedStateCode?.state_code || getselectedStateCode?.name,
+              postalCode,
+              country,
+            },
+          });
         } else {
           console.log("Some orders failed:", Response.data);
           console.log("Failed orders:", Response.data.filter(order => order.status !== 1));
@@ -1425,24 +2031,13 @@ const Checkout2 = () => {
             city: city,
             postalCode: postalCode,
             country: country,
-            productTotal:
-              getproductPrice != null && !isNaN(getproductPrice)
-                ? discount_percent && discount_percent !== "0.00"
-                  ? (
-                      parseFloat(getproductPrice) -
-                      (parseFloat(getproductPrice) *
-                        (parseFloat(discount_percent) || 0)) /
-                        100
-                    ).toFixed(2)
-                  : (
-                      parseFloat(getproductPrice) -
-                      (parseFloat(discount_amount) || 0)
-                    ).toFixed(2)
-                : "",
-            productId: getproducts[0]?.product_id || "",
+            productTotal: getDiscountedTotal(),
+            productId:
+              getproducts.map((p) => p.product_id).filter(Boolean).join(",") ||
+              "",
             products: getproducts, // Pass full products array for purchase event
             coupon: appliedDiscount || "",
-            discountAmount: discount_amount || 0,
+            discountAmount: getCouponSavings(),
           },
         });
         // google tag pixel start Event snippet for Purchase conversion page
@@ -1454,27 +2049,21 @@ const Checkout2 = () => {
         }
         // google tag pixel end
 
-        // facebook pixel start
-        if (window.fbq) {
-          window.fbq("track", "Purchase", {
-            value:
-              getproductPrice != null && !isNaN(getproductPrice)
-                ? discount_percent && discount_percent !== "0.00"
-                  ? (
-                      parseFloat(getproductPrice) -
-                      (parseFloat(getproductPrice) *
-                        (parseFloat(discount_percent) || 0)) /
-                        100
-                    ).toFixed(2)
-                  : (
-                      parseFloat(getproductPrice) -
-                      (parseFloat(discount_amount) || 0)
-                    ).toFixed(2)
-                : "",
-            currency: "USD",
-          });
-        }
-        // facebook pixel end
+        trackMetaPurchase({
+          orderId: orderIds[0],
+          value: getDiscountedTotal() || 0,
+          products: getproducts,
+          userData: {
+            email,
+            phone: phoneNumber,
+            firstName,
+            lastName,
+            city,
+            state: getselectedStateCode?.state_code || getselectedStateCode?.name,
+            postalCode,
+            country,
+          },
+        });
       } else if (Response.data.status == 5) {
         console.log("Payment update required:", Response.data);
         notifyError(Response.data.message);
@@ -1542,45 +2131,51 @@ const Checkout2 = () => {
   // Track payment info entry for ce_add_payment_info event
   const [paymentInfoFired, setPaymentInfoFired] = useState(false);
 
-  // Fire ce_add_payment_info when payment details are entered
+  // Fire ce_add_payment_info when Stripe payment form is ready
   useEffect(() => {
-    // Only fire if:
-    // 1. Products are loaded
-    // 2. Card number has valid length (15-16 digits)
-    // 3. Expiry date is entered (MM/YY format = 5 chars)
-    // 4. CVV is entered (3-4 digits)
-    // 5. Card holder name is entered
-    // 6. Event hasn't been fired yet
-    // 7. Not on initial page load (products must be loaded first)
     if (
       !paymentInfoFired &&
-      getproducts.length > 0 &&
-      cardNumber.length >= 15 &&
-      cardNumber.length <= 16 &&
-      expiryDate.length === 5 &&
-      cvv.length >= 3 &&
-      cardholdername.trim().length > 0
+      getsection2 &&
+      stripeClientSecret &&
+      getproducts.length > 0
     ) {
-      // Calculate total with discount
-      const totalPrice = parseFloat(getproductPrice || 0);
-      const finalTotal = discount_percent && discount_percent !== "0.00"
-        ? totalPrice - (totalPrice * (parseFloat(discount_percent) || 0)) / 100
-        : totalPrice - (parseFloat(discount_amount) || 0);
-
       try {
         fireAddPaymentInfo({
           products: getproducts,
-          totalValue: finalTotal,
-          paymentType: 'Credit Card',
-          coupon: appliedDiscount || '',
-          discountAmount: discount_amount || 0,
+          totalValue: calculateTotal(),
+          paymentType: "Stripe",
+          coupon: appliedDiscount || "",
+          discountAmount: getCouponSavings(),
+        });
+        trackMetaAddPaymentInfo({
+          value: calculateTotal(),
+          products: getproducts,
+          userData: {
+            email,
+            phone: phoneNumber,
+            firstName,
+            lastName,
+            city,
+            state: getselectedStateCode?.state_code || getselectedStateCode?.name,
+            postalCode,
+            country,
+          },
+          eventId: `AddPaymentInfo_${email || "guest"}_${Date.now()}`,
         });
         setPaymentInfoFired(true);
       } catch (error) {
         console.error("Error firing ce_add_payment_info:", error);
       }
     }
-  }, [cardNumber, expiryDate, cvv, cardholdername, getproducts, getproductPrice, discount_percent, discount_amount, appliedDiscount, paymentInfoFired]);
+  }, [
+    paymentInfoFired,
+    getsection2,
+    stripeClientSecret,
+    getproducts,
+    calculateTotal,
+    appliedDiscount,
+    discount_amount,
+  ]);
 
   // useEffect for close modal after 3 secound
   useEffect(() => {
@@ -1634,13 +2229,11 @@ const Checkout2 = () => {
       setIsEmailLoading(true); // Start loading only if email is valid
 
       try {
-        // Use the first product ID for member view API (or you might need to modify this API to handle multiple products)
-        const firstProductId =
-          getproducts.length > 0 ? getproducts[0].product_id : id;
+        const couponProductId = getCouponProductId();
 
         const response = await axios.post(member_view, {
           email: email,
-          product_id: firstProductId,
+          product_id: couponProductId,
           campaign_id: getcampaignID,
         });
         console.log("API Response:", response.data);
@@ -2256,106 +2849,58 @@ const Checkout2 = () => {
                 {/* contect box end */}
                 <br />
 
-                {/* payment box start */}
+                {/* payment (Stripe) */}
                 <p className="pg2_heading">Payment</p>
                 <p className="pg2_des">
                   All transactions are secure and encrypted.
                 </p>
-                <div className="paymentbox_main_wrapp">
-                  <div className="paymentbox_header">
-                    <p className="pg2_heading">Credit card</p>
-                    <div className="card_icon_div">
-                      <img
-                        src={images.visa}
-                        className="item_img_card"
-                        alt="Headphones"
-                      />
-                      <img
-                        src={images.master}
-                        className="item_img_card"
-                        alt="Headphones"
-                      />
-                      <img
-                        src={images.jcb}
-                        className="item_img_card"
-                        alt="Headphones"
-                      />
-                      <img
-                        src={images.american}
-                        className="item_img_card"
-                        alt="Headphones"
-                      />
-                    </div>
-                  </div>
-                  {/* <div className="paymentbox_contain"> */}
-                  <div className="form-group">
-                    <input
-                      type="text"
-                      placeholder="Card number"
-                      className="card-number"
-                      value={formatCardNumber(cardNumber)}
-                      onChange={(e) => {
-                        const input = e.target.value.replace(/\D/g, ""); // Remove non-numeric characters
-                        if (input.length <= 16) {
-                          setCardNumber(input);
-                        }
-                      }}
+
+                {stripePaymentError && (
+                  <div className="stripe-checkout-error">{stripePaymentError}</div>
+                )}
+
+                {isCreatingPaymentIntent && (
+                  <p className="stripe-payment-loading">
+                    Initializing secure payment…
+                  </p>
+                )}
+
+                {stripeClientSecret && (
+                  <Elements
+                    key={stripeClientSecret}
+                    stripe={getStripePromise()}
+                    options={{
+                      clientSecret: stripeClientSecret,
+                      appearance: stripeAppearance,
+                      locale: "en-US",
+                    }}
+                  >
+                    <StripeCheckoutForm
+                      amountInCents={getCheckoutAmountCents()}
+                      billingDefaults={stripeBillingDefaults}
+                      onValidateBilling={validateBillingAddress}
+                      onPersistCheckoutSnapshot={() =>
+                        saveCheckoutSnapshot(getCheckoutSnapshot())
+                      }
+                      onPaymentSuccess={(paymentToken, clientSecret) =>
+                        finalizeStripeOrder(paymentToken, clientSecret)
+                      }
+                      onExpressPaymentSuccess={(paymentToken, clientSecret) =>
+                        finalizeStripeOrder(paymentToken, clientSecret)
+                      }
+                      disabled={isloading}
                     />
-                  </div>
-                  <div className="form-group">
-                    <input
-                      type="text"
-                      placeholder="Name on card"
-                      className="card-number"
-                      value={cardholdername}
-                      onChange={(e) => setcardholdername(e.target.value)}
-                    />
-                  </div>
-                  <div className="form-group-inline">
-                    <div className="form-group">
-                      <input
-                        type="text"
-                        placeholder="Expiration date (MM/YY)"
-                        className="expiry-date"
-                        value={expiryDate}
-                        onChange={(e) => {
-                          let input = e.target.value;
-                          // Remove non-numeric characters except "/"
-                          input = input.replace(/\D/g, "");
+                  </Elements>
+                )}
 
-                          // Ensure input is limited to 4 characters (MMYY format)
-                          if (input.length > 4) {
-                            input = input.slice(0, 4);
-                          }
-
-                          // Extract MM and YY
-                          const month = input.slice(0, 2);
-                          const year = input.slice(2, 4);
-
-                          // Update state for ex_month and ex_year
-                          setExMonth(month);
-                          setExYear(year);
-
-                          // Format input to display MM/YY in the input field
-                          setExpiryDate(
-                            month + (year.length > 0 ? "/" + year : "")
-                          );
-                        }}
-                      />
-                    </div>
-                    <div className="form-group">
-                      <input
-                        type="text"
-                        placeholder="Security code"
-                        className="cvv"
-                        value={cvv}
-                        onChange={handleChange}
-                        maxLength={4}
-                      />
-                    </div>
-                  </div>
-                  {/* </div> */}
-                </div>
+                {!stripeClientSecret &&
+                  !isCreatingPaymentIntent &&
+                  !stripePaymentError && (
+                    <p className="stripe-payment-loading">
+                      Please complete your contact and shipping details to
+                      enable payment.
+                    </p>
+                  )}
                 {/* payment box end */}
                 <br />
                 {/* billing address start */}
@@ -2592,13 +3137,6 @@ const Checkout2 = () => {
                   </ul>
                 </div>
                 <br />
-                <button
-                  className="apply-button"
-                  style={{ width: "100%" }}
-                  onClick={Page2Validate}
-                >
-                  CHECKOUT NOW
-                </button>
 
                 <center>
                   <div className="ssl-secured-payment">
@@ -2880,24 +3418,13 @@ const Checkout2 = () => {
                 <>
                   {(getproducts?.length > 0 ? getproducts : [getdata]).map(
                     (product, index) => {
-
                       const price = parseFloat(product?.product_price);
-                      // detect months from product name
-                      let months = 1;
-                      if (product.product_name?.includes("3 Month")) months = 3;
-                      if (product.product_name?.includes("6 Month")) months = 6;
-                      if (product.product_name?.includes("12 Month")) months = 12;
-
-                      const productIdStr = String(product?.product_id ?? "");
-                      const showMonthlyCostLine = Object.prototype.hasOwnProperty.call(MONTHLY_COST_LINE_PRODUCTS, productIdStr);
-                      const fixedMonthly = MONTHLY_COST_LINE_PRODUCTS[productIdStr];
-                      const monthlyCost = showMonthlyCostLine
-                        ? (fixedMonthly != null ? Number(fixedMonthly).toFixed(2) : (price / months).toFixed(2))
-                        : null;
-
-                      console.log("API product:", product);
-                      console.log("API price:", product.product_price);
-                      console.log("Displayed price:", getproductPrice);
+                      const displayPrice = !isNaN(price) ? price.toFixed(2) : null;
+                      const months = getMonthsFromProductName(product?.product_name);
+                      const monthlyCost =
+                        months > 1 && !isNaN(price)
+                          ? (price / months).toFixed(2)
+                          : null;
 
                       return(
                       <div key={product.product_id || index} className="item">
@@ -2924,28 +3451,10 @@ const Checkout2 = () => {
                             </span>
                           )} */}
                             <span className="discounted-price">
-                              {/* {product.product_price != null &&
-                              !isNaN(product.product_price)
-                                ? discount_percent &&
-                                  discount_percent !== "0.00"
-                                  ? "$" +
-                                    (
-                                      parseFloat(product.product_price) -
-                                      (parseFloat(product.product_price) *
-                                        (parseFloat(discount_percent) || 0)) /
-                                        100
-                                    ).toFixed(2)
-                                  : "$" +
-                                    (
-                                      parseFloat(product.product_price) -
-                                      (parseFloat(discount_amount) || 0)
-                                    ).toFixed(2)
-                                : "$" + product.product_price} */}
-                                 ${Number(getproductPrice).toFixed(2)}
+                                 {displayPrice != null ? `$${displayPrice}` : ""}
                             </span>
-                            {showMonthlyCostLine && monthlyCost != null && (
+                            {monthlyCost != null && (
                             <span>
-                        {/* Monthly Cost Line - only for product IDs 92, 93, 94, 95, 96 */}
                                 <p className="monthly-cost" style={{  color: "green" }}>
                                   ${monthlyCost}/mo
                                 </p>
@@ -3023,11 +3532,7 @@ const Checkout2 = () => {
                 <div className="savings-banner">
                   <MdOutlineCelebration size={25} />
                   <span>
-                    You saved{" "}
-                    {discount_percent == "0.00"
-                      ? "$" + `${discount_amount}`
-                      : `${Math.trunc(discount_percent)}` + "%"}{" "}
-                    on your order
+                    You saved ${getCouponSavings().toFixed(2)} on your order.
                   </span>
                 </div>
               )}
@@ -3054,21 +3559,26 @@ const Checkout2 = () => {
                     />
                     <span style={{ color: "var(--clr-main)" }}>
                       {totalText}{" "}
-                      {getproductPrice != null && !isNaN(getproductPrice)
-                        ? discount_percent && discount_percent !== "0.00"
-                          ? "$" +
-                            (
-                              parseFloat(getproductPrice) -
-                              (parseFloat(getproductPrice) *
-                                (parseFloat(discount_percent) || 0)) /
-                                100
-                            ).toFixed(2)
-                          : "$" +
-                            (
-                              parseFloat(getproductPrice) -
-                              (parseFloat(discount_amount) || 0)
-                            ).toFixed(2)
-                        : ""}
+                      {getproductPrice != null && !isNaN(getproductPrice) ? (
+                        isDiscountApplied ? (
+                          <>
+                            <span
+                              style={{
+                                marginRight: "10px",
+                                textDecoration: "line-through",
+                                color: "red",
+                              }}
+                            >
+                              ${parseFloat(getproductPrice).toFixed(2)}
+                            </span>
+                            <span>${getDiscountedTotal()}</span>
+                          </>
+                        ) : (
+                          `$${parseFloat(getproductPrice).toFixed(2)}`
+                        )
+                      ) : (
+                        ""
+                      )}
                     </span>
                     <div className="expand-button">
                       <span>
@@ -3102,9 +3612,7 @@ const Checkout2 = () => {
                             style={{ marginRight: "10px", color: "#4caf50" }}
                             className="originsal-price"
                           >
-                            {discount_percent == "0.00"
-                              ? "$" + `${discount_amount}`
-                              : `${Math.trunc(discount_percent)}` + "%"}
+                            ${getCouponSavings().toFixed(2)}
                           </span>
                         </div>
                       </div>
@@ -3128,21 +3636,28 @@ const Checkout2 = () => {
                           }}
                           className="originsal-price"
                         >
-                          {getproductPrice != null && !isNaN(getproductPrice)
-                            ? discount_percent && discount_percent !== "0.00"
-                              ? "$" +
-                                (
-                                  parseFloat(getproductPrice) -
-                                  (parseFloat(getproductPrice) *
-                                    (parseFloat(discount_percent) || 0)) /
-                                    100
-                                ).toFixed(2)
-                              : "$" +
-                                (
-                                  parseFloat(getproductPrice) -
-                                  (parseFloat(discount_amount) || 0)
-                                ).toFixed(2)
-                            : ""}
+                          {getproductPrice != null && !isNaN(getproductPrice) ? (
+                            isDiscountApplied ? (
+                              <>
+                                <span
+                                  className="original-price"
+                                  style={{ marginRight: "10px" }}
+                                >
+                                  ${parseFloat(getproductPrice).toFixed(2)}
+                                </span>
+                                <span
+                                  className="discounted-price"
+                                  style={{ color: "var(--clr-main)" }}
+                                >
+                                  ${getDiscountedTotal()}
+                                </span>
+                              </>
+                            ) : (
+                              `$${parseFloat(getproductPrice).toFixed(2)}`
+                            )
+                          ) : (
+                            ""
+                          )}
                         </span>
                       </div>
                     </div>
@@ -3223,21 +3738,28 @@ const Checkout2 = () => {
                           }}
                           className="originsal-price"
                         >
-                          {getproductPrice != null && !isNaN(getproductPrice)
-                            ? discount_percent && discount_percent !== "0.00"
-                              ? "$" +
-                                (
-                                  parseFloat(getproductPrice) -
-                                  (parseFloat(getproductPrice) *
-                                    (parseFloat(discount_percent) || 0)) /
-                                    100
-                                ).toFixed(2)
-                              : "$" +
-                                (
-                                  parseFloat(getproductPrice) -
-                                  (parseFloat(discount_amount) || 0)
-                                ).toFixed(2)
-                            : ""}
+                          {getproductPrice != null && !isNaN(getproductPrice) ? (
+                            isDiscountApplied ? (
+                              <>
+                                <span
+                                  className="original-price"
+                                  style={{ marginRight: "10px" }}
+                                >
+                                  ${parseFloat(getproductPrice).toFixed(2)}
+                                </span>
+                                <span
+                                  className="discounted-price"
+                                  style={{ color: "var(--clr-main)" }}
+                                >
+                                  ${getDiscountedTotal()}
+                                </span>
+                              </>
+                            ) : (
+                              `$${parseFloat(getproductPrice).toFixed(2)}`
+                            )
+                          ) : (
+                            ""
+                          )}
                         </span>
                       </div>
                     </div>
@@ -3259,16 +3781,21 @@ const Checkout2 = () => {
                       >
                         {/* checkout details footer - product-specific supply & pricing */}
                         {(() => {
-                          const productId = String(getdata?.product_id ?? getproducts[0]?.product_id ?? "");
-                          const config = PRODUCT_DISCLAIMER_CONFIG[productId];
-                          const months = config?.months;
-                          const totalCost = config?.total;
-                          const monthlyCost = config?.monthly;
-                          const isMultiMonth = config != null;
+                          const product = getproducts[0] || getdata || {};
+                          const months = getMonthsFromProductName(product?.product_name);
+                          const isMultiMonth = months > 1;
+                          const totalCost = parseFloat(product?.product_price ?? getproductPrice);
+                          const monthlyCost =
+                            !isNaN(totalCost) && months > 0
+                              ? totalCost / months
+                              : null;
 
-                          if (isMultiMonth) {
-                            const totalStr = totalCost != null ? `$${Number(totalCost).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "";
-                            const monthlyStr = monthlyCost != null ? `$${Number(monthlyCost).toFixed(2)}` : "";
+                          if (isMultiMonth && !isNaN(totalCost)) {
+                            const totalStr = `$${Number(totalCost).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+                            const monthlyStr =
+                              monthlyCost != null
+                                ? `$${Number(monthlyCost).toFixed(2)}`
+                                : "";
                             return (
                               <>
                                 By clicking the "Checkout Now" button above, your card will be billed {totalStr} today to reserve your {months}-month supply of your medication ({monthlyStr}/month). After you complete the order by clicking the secure "Checkout Now" button above, your information will be securely saved. You will then be asked to complete a short medical history intake and verify your identity. A totarahealth medical professional will review your information, and, if appropriate, prescribe your medication. If you are not eligible for your medication for ANY reason, you will receive a full refund of your purchase price. You have selected the {months}-month package, which includes a {months}-month supply. Your package includes your medication and detailed instructions on how to properly administer the medication. Your total cost is {totalStr} ({monthlyStr}/month). It includes your medication, unlimited doctor support, and prescription covered. If at any time you decide not to continue, simply contact us <a href="mailto:rxsupport@totara.health"> rxsupport@totara.health</a>. You will not be billed further. While you are a member, you will have access to chat with your doctor or customer support for any needed assistance.
@@ -3276,21 +3803,13 @@ const Checkout2 = () => {
                             );
                           }
 
-                          const discountedPrice =
-                            discount_percent !== "0.00"
-                              ? "$" +
-                                (
-                                  parseFloat(getproductPrice) -
-                                  (parseFloat(getproductPrice) * discount_percent) / 100
-                                ).toFixed(2)
-                              : "$" +
-                                (parseFloat(getproductPrice) - (parseFloat(discount_amount) || 0)).toFixed(2);
+                          const discountedPrice = isDiscountApplied
+                            ? `$${getDiscountedTotal()}`
+                            : `$${parseFloat(getproductPrice || 0).toFixed(2)}`;
 
-                          // NAD+ Injection (id 38): recurring price is $200.00/mo regardless of initial discounted price
                           const recurringPriceDisplay =
-                            productId === "38"
-                              ? "$200.00"
-                              : "$" + Number(getdata?.product_price ?? getproductPrice ?? 0).toFixed(2);
+                            "$" +
+                            Number(product?.product_price ?? getproductPrice ?? 0).toFixed(2);
 
                           return (
                             <>
